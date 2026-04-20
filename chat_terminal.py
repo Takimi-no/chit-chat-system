@@ -70,7 +70,7 @@ def generate_reply(
     repetition_penalty = 1.1,   # 同じ単語や表現の繰り返しを抑える
 ):
     '''
-    1. prompt(入力の文章)をtokenizerを通してバイナリ化
+    1. prompt(入力の文章)をtokenizerを通してID列化
     2. model.generate()で後続のトークン生成
     3. 入力部分を除いて、生成された文章だけ取り出す
     4. 取り出した文章を文字列に戻す
@@ -85,9 +85,14 @@ def generate_reply(
         # output_ids：出力のid列
         # model.generate：文章の続きを自動生成する関数(Decoder型ならでは)
         output_ids = model.generate(
+            # pt型で取得したinput(pt型、辞書みたいなもの)の引数として展開している。
+            # 入力文字列を1つのid列として展開している。
+            # attentionmask：paddingの位置を示すもの
             **inputs,
             max_new_tokens = max_new_tokens,
+            # 次単語を確率的に選ぶ
             do_sample = True,
+            # ランダム具合の強さ
             temperature = temperature,
             top_p = top_p,
             repetition_penalty = repetition_penalty,
@@ -95,11 +100,24 @@ def generate_reply(
             eos_token_id = tokenizer.eos_token_id,
         )
         
+    # output_idsは入力+出力が含まれる
+    # transformerの使用でどうしても2次元になってしまう
+    # gererated_idsに、入力の文字より後の要素(出力文)を代入
     generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
+    # skip_special_tokens：特殊トークンを明示しない設定
+    # 出力id列をtokenizerを通して、文字列に変換
     text = tokenizer.decode(generated_ids, skip_special_tokens = True)
     
     # 例外処理：User：が出た時点で区切る
+    # 出力発話以降にさらに追加で作成してしまう事象を抑える
+    '''
+    例)
+    こんにちは！
+    User: 元気？
+    Assistant: 元気です！
+    '''
     if "\nUser:" in text:
         text = text.split("\nUser:")[0]
 
+    # 前後の空白・タブを削除して返す
     return text.strip()

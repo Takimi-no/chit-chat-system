@@ -58,3 +58,48 @@ def load_model_and_tokenizer(adapter_path, base_model_name, load_in_4bit=True):
     # 学習時のパラメータ調整などをやめて推論モードにする
     model.eval()
     return model, tokenizer
+
+# 入力文字列をトークン化して、モデルのあるデバイスに移す
+def generate_reply(
+    model,  # load_model_and_tokenizer関数にて作成したmodel(事前学習モデル+LoRA)とtokenizer
+    tokenizer,
+    prompt, # 今回入力する文章を指す
+    max_new_tokens = 128,   # 新しく最大何トークンまで生成するか
+    temperature = 0.8,  # 返答のランダムさ
+    top_p = 0.9,    # 確率の合計が0.9以上になる範囲を候補とする
+    repetition_penalty = 1.1,   # 同じ単語や表現の繰り返しを抑える
+):
+    '''
+    1. prompt(入力の文章)をtokenizerを通してバイナリ化
+    2. model.generate()で後続のトークン生成
+    3. 入力部分を除いて、生成された文章だけ取り出す
+    4. 取り出した文章を文字列に戻す
+    5. 余計に生成されたUser以降を削除する
+    '''
+    # retun_tensors：結果をどのような形式で返すか。pt：Pytorch Tensor
+    # .to()：作った入力をモデルがあるGPUデバイスに移動。無くても問題がないような気もするが、念のため。
+    inputs = tokenizer(prompt,return_tensors = "pt").to(model.device)
+    
+    # with torch.no_grad：勾配を計算しないモード
+    with torch.no_grad():
+        # output_ids：出力のid列
+        # model.generate：文章の続きを自動生成する関数(Decoder型ならでは)
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens = max_new_tokens,
+            do_sample = True,
+            temperature = temperature,
+            top_p = top_p,
+            repetition_penalty = repetition_penalty,
+            pad_token_id = tokenizer.pad_token_id,
+            eos_token_id = tokenizer.eos_token_id,
+        )
+        
+    generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
+    text = tokenizer.decode(generated_ids, skip_special_tokens = True)
+    
+    # 例外処理：User：が出た時点で区切る
+    if "\nUser:" in text:
+        text = text.split("\nUser:")[0]
+
+    return text.strip()

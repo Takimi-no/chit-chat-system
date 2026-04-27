@@ -27,7 +27,7 @@ def build_bad_words_ids(tokenizer):
     bad_words = []
     for tok, tid in vocab.items():
         if any("\uE000" <= c <= "\uF8FF" for c in tok):
-            bad_words.append(tid)
+            bad_words.append([tid])
     return bad_words
 
 def clean_pred(pred:str) -> str:
@@ -67,12 +67,17 @@ def clean_pred(pred:str) -> str:
 # adapter_pathからtokenizerを獲得
 def load_model_and_tokenizer(adapter_path, base_model_name, load_in_4bit=True):
     # トークナイザー処理
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast = True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast = False)
     # eos_token：文の終わりを示すトークン
     # pad_token：長さを調整するためのトークン
     # pad_tokenがなければ、eos_tokenをpad_tokenの代わりに利用する
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"   # 文章の左側にpad_tokenをつける設定
+    
+    bad_words_ids = build_bad_words_ids(tokenizer)
+    print("private-useのトークン数:", len(bad_words_ids))
+    
     # CUDA(GPUのチェック)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA の設定ミス。GPUが見つかっていない")
@@ -99,17 +104,18 @@ def load_model_and_tokenizer(adapter_path, base_model_name, load_in_4bit=True):
     model = PeftModel.from_pretrained(base_model, adapter_path)
     # 学習時のパラメータ調整などをやめて推論モードにする
     model.eval()
-    return model, tokenizer
+    return model, tokenizer,bad_words_ids
 
 # 入力文字列をトークン化して、モデルのあるデバイスに移す
 def generate_reply(
     model,  # load_model_and_tokenizer関数にて作成したmodel(事前学習モデル+LoRA)とtokenizer
     tokenizer,
     prompt, # 今回入力する文章を指す
+    bad_words_ids = None,   # 生成させたくないトークンのIDリスト
     max_new_tokens = 128,   # 新しく最大何トークンまで生成するか
-    temperature = 0.8,  # 返答のランダムさ
-    top_p = 0.9,    # 確率の合計が0.9以上になる範囲を候補とする
     repetition_penalty = 1.1,   # 同じ単語や表現の繰り返しを抑える
+    no_repeat_ngram_size = 3,   # 同じn-gramの繰り返しを抑える(n=3なら、同じ3単語の連続を抑える
+    debug = False,
 ):
     '''
     1. prompt(入力の文章)をtokenizerを通してID列化
@@ -120,7 +126,33 @@ def generate_reply(
     '''
     # retun_tensors：結果をどのような形式で返すか。pt：Pytorch Tensor
     # .to()：作った入力をモデルがあるGPUデバイスに移動。無くても問題がないような気もするが、念のため。
-    inputs = tokenizer(prompt,return_tensors = "pt").to(model.device)
+    inputs = tokenizer(
+        prompt,
+        return_tensors = "pt",
+        truncation = True,
+        max_length = 512,
+    )
+
+    # llm-jp は token_type_ids を受け取らない
+    if "token_type_ids" in inputs:
+        inputs.pop("token_type_ids")
+
+    inputs = inputs.to(model.device)
+
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+    if repetition_penalty and repetition_penalty != 1.0:
+        gen_kwargs["repetition_penalty"] = repetition_penalty
+    if no_repeat_ngram_size and no_repeat_ngram_size > 0:
+        gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+    if bad_words_ids:
+        gen_kwargs["bad_words_ids"] = bad_words_ids
     
     # with torch.no_grad：勾配を計算しないモード
     with torch.no_grad():
@@ -131,38 +163,28 @@ def generate_reply(
             # 入力文字列を1つのid列として展開している。
             # attentionmask：paddingの位置を示すもの
             **inputs,
-            max_new_tokens = max_new_tokens,
-            # 次単語を確率的に選ぶ
-            do_sample = True,
-            # ランダム具合の強さ
-            temperature = temperature,
-            top_p = top_p,
-            repetition_penalty = repetition_penalty,
-            pad_token_id = tokenizer.pad_token_id,
-            eos_token_id = tokenizer.eos_token_id,
+            **gen_kwargs,
         )
         
-    # output_idsは入力+出力が含まれる
-    # transformerの使用でどうしても2次元になってしまう
-    # gererated_idsに、入力の文字より後の要素(出力文)を代入
+    # 入力部分を除いて、新規生成分だけ取る
     generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
-    # skip_special_tokens：特殊トークンを明示しない設定
-    # 出力id列をtokenizerを通して、文字列に変換
-    text = tokenizer.decode(generated_ids, skip_special_tokens = True)
     
-    # 例外処理：User：が出た時点で区切る
-    # 出力発話以降にさらに追加で作成してしまう事象を抑える
-    '''
-    例)
-    こんにちは！
-    User: 元気？
-    Assistant: 元気です！
-    '''
-    if "\nUser:" in text:
-        text = text.split("\nUser:")[0]
+    pred = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-    # 前後の空白・タブを削除して返す
-    return text.strip()
+    if debug:
+        print("==== FULL OUTPUT (repr) ====")
+        print(repr(pred))
+        print("================================")
+        
+    pred = pred.split("\nUser:",1)[0]
+
+    # 念のため先頭の "Assistant:" も消す
+    if pred.startswith("Assistant:"):
+        pred = pred[len("Assistant:"):]
+
+    # 異常文字が出たらそこで打ち切る
+    pred = clean_pred(pred).strip()
+    return pred
 
 
 def main():
@@ -180,8 +202,8 @@ def main():
         help="ベースモデル名",
     )
     parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top_p", type=float, default=0.9)
+    # parser.add_argument("--temperature", type=float, default=0.8)
+    # parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
     parser.add_argument(
         "--max_turns",
@@ -197,7 +219,7 @@ def main():
     args = parser.parse_args()
 
     print("モデル読み込み中...")
-    model, tokenizer = load_model_and_tokenizer(
+    model, tokenizer,bad_words_ids= load_model_and_tokenizer(
         adapter_path=args.adapter_path,
         base_model_name=args.base_model,
         load_in_4bit=not args.no_4bit,
@@ -236,9 +258,12 @@ def main():
                 tokenizer=tokenizer,
                 prompt=prompt,
                 max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
+                # temperature=args.temperature,
+                # top_p=args.top_p,
                 repetition_penalty=args.repetition_penalty,
+                bad_words_ids=bad_words_ids,
+                no_repeat_ngram_size=3,
+                debug=False,
             )
         except RuntimeError as e:
             print(f"生成中にエラー: {e}")
